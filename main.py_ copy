@@ -1,0 +1,271 @@
+'''
+다시 로컬에서 huggingface 모델을 사용하여 테스트 하려고 수정함
+원래는 GIANT 에서 돌려보려고 했는데, 
+- 접속이 안됨
+'''
+
+import os
+from pathlib import Path
+from typing import Protocol, List, Dict, Any
+from dotenv import load_dotenv
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.pipelines import pipeline
+from pydantic import SecretStr
+import pprint
+import argparse
+
+# HuggingFace Qwen1.5-7B-Chat Backend (이제 Phi-3-mini-4k-instruct로 사용)
+class HuggingFaceBackend:
+    def __init__(self, model_name: str = "microsoft/Phi-3-mini-4k-instruct", device: str = "cpu"):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
+        self.pipe = pipeline("text-generation", model=self.model, tokenizer=self.tokenizer, device=device)
+
+    def generate(self, prompt: str) -> str:
+        output = self.pipe(prompt, max_new_tokens=512, do_sample=True, temperature=0.7)
+        return output[0]["generated_text"].replace(prompt, "").strip()
+
+# 기존 OpenAI Backend (선택적으로 사용)
+class LLMBackend(Protocol):
+    def generate(self, prompt: str) -> str:
+        ...
+
+class OpenAIBackend:
+    def __init__(self, api_key: str, model: str = "gpt-3.5-turbo"):
+        import openai
+        self.openai = openai
+        self.api_key = api_key
+        self.model = model
+        self.openai.api_key = api_key
+
+    def generate(self, prompt: str) -> str:
+        response = self.openai.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+            temperature=0.7,
+        )
+        content = response.choices[0].message.content
+        return content.strip() if content else ""
+
+# @tool 기반 파일 시스템 도구들
+@tool
+def list_directory(path: str) -> Dict[str, List[str]]:
+    """Return a list of directories and files (with absolute paths) under the given path."""
+    dirs, files = [], []
+    with os.scandir(path) as it:
+        for entry in it:
+            if entry.is_dir():
+                dirs.append(os.path.abspath(entry.path))
+            elif entry.is_file():
+                files.append(os.path.abspath(entry.path))
+    return {"directories": dirs, "files": files}
+
+@tool
+def create_directory(path: str) -> bool:
+    """Create a directory at the given path. Returns True if it already exists or is created successfully, False on failure."""
+    try:
+        os.makedirs(path, exist_ok=True)
+        return True
+    except Exception:
+        return False
+
+@tool
+def read_files(path: str) -> Dict[str, str]:
+    """Read all files under the given path and return a dict {filename: content}. Ignores directories."""
+    result = {}
+    for entry in os.scandir(path):
+        if entry.is_file():
+            with open(entry.path, "r", encoding="utf-8") as f:
+                result[entry.name] = f.read()
+    return result
+
+@tool
+def read_file(path: str) -> str:
+    """Read and return the content of the file at the given path."""
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+@tool
+def write_file(path: str, content: str) -> bool:
+    """Create or overwrite a file at the given path with the given content. Returns True on success, False on failure."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return True
+    except Exception:
+        return False
+
+tools = [list_directory, create_directory, read_files, write_file, read_file]
+
+# system prompt (README/llms.txt 생성용)
+system_prompt = """
+# LLM System Prompt for README & llms.txt Generation
+
+## System Prompt
+
+You are an expert technical writer specializing in creating comprehensive documentation for software projects. Your primary task is to generate high-quality README files and llms.txt files that serve as the foundation for project understanding and LLM integration.
+
+### Core Responsibilities
+
+1. **README Generation**: Create clear, comprehensive, and well-structured README files that follow industry best practices
+2. **llms.txt Creation**: Generate structured documentation files optimized for LLM consumption and understanding
+3. **Documentation Standards**: Ensure all generated content follows markdown conventions and accessibility guidelines
+
+### README Generation Guidelines
+
+#### Structure Requirements
+- **Project Title**: Clear, descriptive project name
+- **Description**: Concise overview of what the project does and why it exists
+- **Installation**: Step-by-step setup instructions
+- **Usage**: Basic usage examples with code snippets
+- **Features**: Key functionality and capabilities
+- **API Documentation**: If applicable, include endpoint descriptions
+- **Contributing**: Guidelines for contribution
+- **License**: License information
+- **Changelog**: Version history and updates
+
+#### Content Standards
+- Use clear, concise language accessible to both technical and non-technical users
+- Include practical code examples that users can copy and run
+- Provide troubleshooting sections for common issues
+- Add badges for build status, version, license, etc.
+- Include screenshots or diagrams when helpful
+- Ensure all links are working and properly formatted
+
+#### Technical Writing Best Practices
+- Use active voice and present tense
+- Break up long sections with subheadings
+- Include table of contents for longer documents
+- Use consistent formatting throughout
+- Provide context for technical terms
+- Include prerequisites and dependencies
+
+### llms.txt Generation Guidelines
+
+#### Purpose and Format
+The llms.txt file should serve as a comprehensive knowledge base for LLM consumption, following the llms.txt standard format.
+
+#### Structure Requirements
+```
+# Project Name
+
+## Overview
+[Comprehensive project description optimized for LLM understanding]
+
+## Architecture
+[Technical architecture and design patterns]
+
+## API Reference
+[Complete API documentation with examples]
+
+## Code Examples
+[Practical code snippets and usage patterns]
+
+## Configuration
+[Configuration options and environment setup]
+
+## Troubleshooting
+[Common issues and solutions]
+
+## Development
+[Development workflow and contribution guidelines]
+```
+
+#### Content Optimization for LLMs
+- Use structured headings and consistent formatting
+- Include comprehensive context for all concepts
+- Provide complete code examples with explanations
+- Use clear, unambiguous language
+- Include error handling and edge cases
+- Add metadata about dependencies and versions
+- Structure information hierarchically
+
+### Quality Assurance Checklist
+
+Before finalizing documentation:
+- [ ] All code examples are tested and functional
+- [ ] Links are verified and working
+- [ ] Spelling and grammar are correct
+- [ ] Formatting is consistent throughout
+- [ ] Information is up-to-date and accurate
+- [ ] Documentation serves both human and LLM readers effectively
+
+### Input Processing Instructions
+
+When given a project or codebase:
+1. **Analyze**: Understand the project's purpose, architecture, and key features
+2. **Structure**: Organize information logically and hierarchically
+3. **Generate**: Create both README.md and llms.txt files
+4. **Optimize**: Ensure content is optimized for both human readability and LLM consumption
+5. **Validate**: Review for completeness and accuracy
+
+### Output Format
+
+Always provide:
+1. **README.md**: Human-friendly documentation following markdown standards
+2. **llms.txt**: LLM-optimized documentation following the llms.txt format
+3. **Summary**: Brief explanation of the generated documentation structure
+
+### Additional Considerations
+
+- Adapt tone and technical depth based on the project's target audience
+- Include relevant badges and shields for professional appearance
+- Ensure accessibility compliance (alt text for images, proper heading hierarchy)
+- Consider internationalization if the project has global reach
+- Include performance benchmarks or metrics when relevant
+- Add security considerations and best practices when applicable
+
+Remember: Great documentation is not just about what you include, but how you present it. Prioritize clarity, completeness, and usability for both human developers and AI systems.
+"""
+
+def main():
+    load_dotenv()
+    # 인자 파싱: 프로젝트 경로, 모델 이름, device
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project_path", type=str, default="/project", help="Project directory path")
+    parser.add_argument("--model_name", type=str, default="microsoft/Phi-3-mini-4k-instruct", help="HuggingFace model name")
+    parser.add_argument("--device", type=str, default="cpu", help="Device for inference (cpu, mps, cuda)")
+    args = parser.parse_args()
+    project_path = args.project_path
+    model_name = args.model_name
+    device = args.device
+
+    # HuggingFace 로컬 LLM 사용 (모델명/디바이스 인자화)
+    llm = HuggingFaceBackend(model_name=model_name, device=device)
+
+    # LangGraph Agent 예시 - 로컬 LLM을 agent에 연결
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+
+    class LocalChatModel(BaseChatModel):
+        @property
+        def _llm_type(self) -> str:
+            return "local-phi3"
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            prompt = "\n".join([
+                m.content for m in messages if hasattr(m, "content") and isinstance(m.content, str)
+            ])
+            response = llm.generate(prompt)
+            return AIMessage(content=response)
+
+        def invoke(self, messages, **kwargs):
+            return self._generate(messages, **kwargs)
+
+    model = LocalChatModel()
+    agent = create_react_agent(model, tools)
+    user_prompt = f"Check the files in the '{project_path}' project and generate a README.md file and llms.txt file."
+    result = agent.invoke({
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+    })
+    pprint.pprint(result)
+
+if __name__ == "__main__":
+    main()
